@@ -27,7 +27,7 @@ crons = ["*/5 * * * *"]
 
 # ═══════════════════════════════════════════════════════════════
 # 本番環境 (aiagent.mini@)
-# 使い方: npx wrangler deploy --env production --name line-crm-worker
+# 使い方: npx wrangler deploy --env production --name your-worker-name
 # D1:     npx wrangler d1 execute line-crm --env production --remote --file ...
 # ═══════════════════════════════════════════════════════════════
 [env.production]
