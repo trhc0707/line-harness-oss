@@ -313,9 +313,71 @@ curl -s ".../api/tracked-links/LINK_UUID" -H "Authorization: Bearer $KEY" | \
   jq '{clickCount: .data.clickCount, uniqueClickers: (.data.clicks | map(.friendId) | unique | length)}'
 ```
 
+## キャンペーンメッセージ (v0.10+)
+
+トラッキングリンクは、流入時 (intro) と特典送付時 (reward) のメッセージテンプレートを紐付けられる。これにより 1 つのフォームを複数キャンペーンで再利用しても、各キャンペーンが独自の文面を出せる。
+
+### 追加カラム
+
+| カラム | 用途 | マイグレーション |
+|---|---|---|
+| `intro_template_id` | 友だち追加直後（form push 直前）に届く push メッセージのテンプレ | `020_tracked_link_intro.sql` |
+| `reward_template_id` | フォーム送信 + verify 通過後に届く特典メッセージのテンプレ | `021_tracked_link_reward.sql` |
+
+両方とも `message_templates(id)` を参照。NULL の場合はデフォルト挙動（intro: ハードコード Flex / reward: フォームの `on_submit_message_*`）。
+
+### intro メッセージ
+
+`/r/:ref?form=FORM_ID` 経由で友だち追加 + LIFF 起動した直後に発火。テンプレ内に `{formUrl}` を含めると送信時に実 LIFF フォーム URL に置換される。
+
+`{formUrl}` を含まないテンプレや壊れた Flex JSON は安全のためデフォルト Flex (`apps/worker/src/services/intro-message.ts:DEFAULT_FORM_LINK_FLEX`) にフォールバック。
+
+### reward メッセージ — キャンペーン単位の解決 (v0.10.1+)
+
+フォーム送信 + verify 通過後の reward は、**当該キャンペーンの tracked link** (= LIFF URL の `?ref=`) に紐付いた `reward_template_id` から解決される。LIFF クライアントが `?ref=` を読み取り、`/api/forms/:id/submit` の body に `trackedLinkId` として乗せる。
+
+解決優先度 (`apps/worker/src/services/reward-resolver.ts`):
+
+1. `body.trackedLinkId` が指定され、該当 link が DB に存在する場合
+   - その link の `reward_template_id` を採用
+   - `reward_template_id` が NULL なら `null` を返し、フォームの `on_submit_message_*` に委譲（**他キャンペーンに漏らさない**）
+2. 上記が不発（`trackedLinkId` 不明 / link が見つからない）な場合
+   - `friends.first_tracked_link_id` (first-touch attribution) にフォールバック
+3. それも不発なら `null` を返し、フォームの `on_submit_message_*` を使う
+
+テンプレ内 `{displayName}` は friend 表示名に置換される（JSON-escape 済みなので Flex でも壊れない）。
+
+#### v0.10.0 → v0.10.1 の挙動差
+
+| シナリオ | v0.10.0 | v0.10.1 |
+|---|---|---|
+| 既存友だちが新キャンペーンの link → 同じフォームを再 submit | 古い (first-touch) キャンペーンの reward | 新しいキャンペーンの reward |
+| 新キャンペーンの link で `reward_template_id=NULL` → submit | 古いキャンペーンの reward が漏れる（バグ） | フォームの `on_submit_message_*` にフォールバック |
+| `?ref=` なし（古いリンク経由） | first-touch reward | first-touch reward（後方互換） |
+
+#### セキュリティモデルの変更
+
+v0.10.0 は `friends.first_tracked_link_id` への 1 回 pin によって URL 改ざんによる reward 奪取を防いでいた。v0.10.1 はその境界を意図的に緩める：
+
+- `/api/forms/:id/submit` の `body.trackedLinkId` を信用するため、攻撃者が手動でリクエストを書き換えると別キャンペーンの reward を取得し得る
+- 本プロジェクトはオプトイン誘導が目的で、上流のエンゲージメントゲート (X Harness 連携など) が真のアンチフラウドを担う前提
+- リプレイ防止層 (`link_clicks.reward_claimed_at` 等) は意図的に **追加していない**
+
+### MCP からテンプレを紐付ける
+
+```
+manage_tracked_links action=update linkId=<id> introTemplateId=<msg-template-id> rewardTemplateId=<msg-template-id>
+```
+
+`introTemplateId` / `rewardTemplateId` を `null` に設定すれば紐付け解除。
+
 ## ソースコード参照
 
 - Worker APIルート: `apps/worker/src/routes/tracked-links.ts`
+- フォーム送信ハンドラ (reward 解決呼び出し): `apps/worker/src/routes/forms.ts`
+- reward 解決サービス (純粋関数 + Vitest): `apps/worker/src/services/reward-resolver.ts`
+- intro メッセージ生成: `apps/worker/src/services/intro-message.ts`
+- reward メッセージ生成 (Flex 描画): `apps/worker/src/services/reward-message.ts`
 - DB クエリ: `packages/db/src/tracked-links.ts`
 - SDK リソース: `packages/sdk/src/resources/tracked-links.ts`
-- マイグレーション: `packages/db/migrations/006_tracked_links.sql`
+- マイグレーション: `packages/db/migrations/006_tracked_links.sql`, `020_tracked_link_intro.sql`, `021_tracked_link_reward.sql`, `022_friend_first_tracked_link.sql`
