@@ -187,6 +187,16 @@ export const api = {
       fetchApi<ApiResponse<null>>(`/api/broadcasts/${id}`, { method: 'DELETE' }),
     send: (id: string) =>
       fetchApi<ApiResponse<ApiBroadcast>>(`/api/broadcasts/${id}/send`, { method: 'POST' }),
+    multicast: (data: {
+      friendIds: string[]
+      messageType: string
+      messageContent: string
+      altText?: string | null
+    }) =>
+      fetchApi<ApiResponse<{ totalCount: number; successCount: number; skippedCount: number }>>('/api/multicast', {
+        method: 'POST',
+        body: JSON.stringify(data),
+      }),
   },
 
   // ── Round 2 APIs ─────────────────────────────────────────────────────────
@@ -354,10 +364,18 @@ export const api = {
         method: 'PUT',
         body: JSON.stringify(data),
       }),
-    send: (id: string, data: { content: string; messageType?: string }) =>
+    send: (id: string, data: { content: string; messageType?: string; sendAt?: string }) =>
       fetchApi<ApiResponse<unknown>>(`/api/chats/${id}/send`, {
         method: 'POST',
         body: JSON.stringify(data),
+      }),
+    scheduledList: (id: string) =>
+      fetchApi<ApiResponse<{ id: string; messageType: string; content: string; sendAt: string; status: string; createdAt: string }[]>>(
+        `/api/chats/${id}/scheduled`,
+      ),
+    cancelScheduled: (chatId: string, messageId: string) =>
+      fetchApi<ApiResponse<{ cancelled: boolean; id: string }>>(`/api/chats/${chatId}/scheduled/${messageId}`, {
+        method: 'DELETE',
       }),
   },
   reminders: {

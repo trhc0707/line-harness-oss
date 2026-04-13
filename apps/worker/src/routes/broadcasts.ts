@@ -242,4 +242,112 @@ broadcasts.post('/api/broadcasts/:id/send-segment', async (c) => {
   }
 });
 
+// POST /api/multicast - send message to specific friend IDs
+broadcasts.post('/api/multicast', async (c) => {
+  try {
+    const body = await c.req.json<{
+      friendIds: string[];
+      messageType: string;
+      messageContent: string;
+      altText?: string | null;
+    }>();
+
+    if (!Array.isArray(body.friendIds) || body.friendIds.length === 0) {
+      return c.json({ success: false, error: 'friendIds array is required' }, 400);
+    }
+    if (!body.messageType || !body.messageContent) {
+      return c.json({ success: false, error: 'messageType and messageContent are required' }, 400);
+    }
+
+    // Fetch friends and get their LINE user IDs
+    const placeholders = body.friendIds.map(() => '?').join(',');
+    const result = await c.env.DB
+      .prepare(`SELECT id, line_user_id, is_following FROM friends WHERE id IN (${placeholders})`)
+      .bind(...body.friendIds)
+      .all<{ id: string; line_user_id: string; is_following: number }>();
+
+    const followingFriends = result.results.filter((f) => f.is_following);
+    if (followingFriends.length === 0) {
+      return c.json({ success: false, error: 'No following friends found in the selection' }, 400);
+    }
+
+    const lineUserIds = followingFriends.map((f) => f.line_user_id);
+
+    // Build message
+    const { extractFlexAltText } = await import('../utils/flex-alt-text.js');
+    let message: import('@line-crm/line-sdk').Message;
+    if (body.messageType === 'text') {
+      message = { type: 'text', text: body.messageContent };
+    } else if (body.messageType === 'flex') {
+      const contents = JSON.parse(body.messageContent);
+      message = { type: 'flex', altText: body.altText || extractFlexAltText(contents), contents };
+    } else if (body.messageType === 'image') {
+      const parsed = JSON.parse(body.messageContent);
+      message = { type: 'image', originalContentUrl: parsed.originalContentUrl, previewImageUrl: parsed.previewImageUrl };
+    } else if (body.messageType === 'video') {
+      const parsed = JSON.parse(body.messageContent);
+      message = { type: 'video', originalContentUrl: parsed.originalContentUrl, previewImageUrl: parsed.previewImageUrl } as import('@line-crm/line-sdk').Message;
+    } else {
+      message = { type: 'text', text: body.messageContent };
+    }
+
+    // Send via multicast in 500-batch chunks
+    const lineClient = new LineClient(c.env.LINE_CHANNEL_ACCESS_TOKEN);
+    const { calculateStaggerDelay, sleep, addMessageVariation } = await import('../services/stealth.js');
+    const BATCH_SIZE = 500;
+    const totalBatches = Math.ceil(lineUserIds.length / BATCH_SIZE);
+    let successCount = 0;
+
+    const { jstNow } = await import('@line-crm/db');
+    const now = jstNow();
+
+    for (let i = 0; i < lineUserIds.length; i += BATCH_SIZE) {
+      const batchIndex = Math.floor(i / BATCH_SIZE);
+      const batch = lineUserIds.slice(i, i + BATCH_SIZE);
+      const batchFriends = followingFriends.slice(i, i + BATCH_SIZE);
+
+      if (batchIndex > 0) {
+        const delay = calculateStaggerDelay(lineUserIds.length, batchIndex);
+        await sleep(delay);
+      }
+
+      let batchMessage = message;
+      if (message.type === 'text' && totalBatches > 1) {
+        batchMessage = { ...message, text: addMessageVariation(message.text, batchIndex) };
+      }
+
+      try {
+        await lineClient.multicast(batch, [batchMessage]);
+        successCount += batch.length;
+
+        // Log messages
+        for (const friend of batchFriends) {
+          const logId = crypto.randomUUID();
+          await c.env.DB
+            .prepare(
+              `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, created_at)
+               VALUES (?, ?, 'outgoing', ?, ?, NULL, NULL, ?)`,
+            )
+            .bind(logId, friend.id, body.messageType, body.messageContent, now)
+            .run();
+        }
+      } catch (err) {
+        console.error(`Multicast batch ${batchIndex} failed:`, err);
+      }
+    }
+
+    return c.json({
+      success: true,
+      data: {
+        totalCount: followingFriends.length,
+        successCount,
+        skippedCount: body.friendIds.length - followingFriends.length,
+      },
+    });
+  } catch (err) {
+    console.error('POST /api/multicast error:', err);
+    return c.json({ success: false, error: 'Internal server error' }, 500);
+  }
+});
+
 export { broadcasts };
