@@ -412,9 +412,56 @@ forms.post('/api/forms/:id/submit', async (c) => {
         sideEffects.push(addTagToFriend(db, friendId, form.on_submit_tag_id));
       }
 
-      // Enroll in scenario
+      // Enroll in scenario (+ immediate delivery of first step)
       if (form.on_submit_scenario_id) {
-        sideEffects.push(enrollFriendInScenario(db, friendId, form.on_submit_scenario_id));
+        const scenarioIdForSubmit = form.on_submit_scenario_id;
+        sideEffects.push(
+          (async () => {
+            await enrollFriendInScenario(db, friendId!, scenarioIdForSubmit);
+            try {
+              const { getScenarioSteps, jstNow, claimFriendScenarioForDelivery, advanceFriendScenario, completeFriendScenario, getLineAccountById } = await import('@line-crm/db');
+              const friend = await getFriendById(db, friendId!);
+              if (!friend?.line_user_id) return;
+              const fsRow = await db
+                .prepare(`SELECT id, current_step_order FROM friend_scenarios WHERE friend_id = ? AND scenario_id = ? LIMIT 1`)
+                .bind(friendId, scenarioIdForSubmit)
+                .first<{ id: string; current_step_order: number }>();
+              if (!fsRow) return;
+              const steps = await getScenarioSteps(db, scenarioIdForSubmit);
+              const currentStep = steps.find((s: any) => s.step_order > fsRow.current_step_order);
+              if (!currentStep || currentStep.delay_minutes !== 0) return;
+              const claimed = await claimFriendScenarioForDelivery(db, fsRow.id, fsRow.current_step_order);
+              if (!claimed) return;
+              const { buildMessage, expandVariables, resolveMetadata } = await import('../services/step-delivery.js');
+              const { LineClient } = await import('@line-crm/line-sdk');
+              const resolvedMeta = await resolveMetadata(db, { user_id: (friend as any).user_id, metadata: (friend as any).metadata });
+              const expanded = expandVariables(currentStep.message_content, { ...friend, metadata: resolvedMeta } as any, c.env.WORKER_URL);
+              let accessToken = c.env.LINE_CHANNEL_ACCESS_TOKEN;
+              const accountId = (friend as any).line_account_id;
+              if (accountId) {
+                const acct = await getLineAccountById(db, accountId);
+                if (acct) accessToken = acct.channel_access_token;
+              }
+              const client = new LineClient(accessToken);
+              const message = buildMessage(currentStep.message_type, expanded);
+              await client.pushMessage(friend.line_user_id, [message]);
+              const logId = crypto.randomUUID();
+              await db.prepare(
+                `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, delivery_type, created_at) VALUES (?, ?, 'outgoing', ?, ?, NULL, ?, 'push', ?)`
+              ).bind(logId, friendId, currentStep.message_type, currentStep.message_content, currentStep.id, jstNow()).run();
+              const nextIndex = steps.indexOf(currentStep) + 1;
+              if (nextIndex < steps.length) {
+                const nextStep = steps[nextIndex];
+                const nextDate = new Date(Date.now() + 9 * 60 * 60_000 + (nextStep.delay_minutes || 0) * 60_000);
+                await advanceFriendScenario(db, fsRow.id, currentStep.step_order, nextDate.toISOString().slice(0, -1) + '+09:00');
+              } else {
+                await completeFriendScenario(db, fsRow.id);
+              }
+            } catch (err) {
+              console.error('form submit immediate scenario delivery error:', err);
+            }
+          })()
+        );
       }
 
       // If webhook returned a join_url (e.g. Meet Harness), send a Flex button to the user
@@ -523,8 +570,6 @@ forms.post('/api/forms/:id/submit', async (c) => {
               type: 'box', layout: 'vertical',
               contents: [
                 ...answerRows,
-                { type: 'separator', margin: 'lg' },
-                { type: 'text', text: '他社サービスでは、フォームの回答内容に合わせたリアルタイム返信はできません。LINE Harnessだからこそ可能な体験です。', size: 'xs', color: '#06C755', weight: 'bold', wrap: true, margin: 'lg' },
               ],
               paddingAll: '20px',
             },
@@ -542,12 +587,14 @@ forms.post('/api/forms/:id/submit', async (c) => {
             // Custom form message replaces default diagnostic result
             const expanded = expandVariables(form.on_submit_message_content, friendData, apiOrigin);
             messages.push(buildMessage(form.on_submit_message_type, expanded));
-          } else {
-            // Default: send diagnostic result Flex
+          } else if (!form.on_submit_scenario_id) {
+            // Default: send diagnostic result Flex (only when no scenario is configured)
             messages.push(buildMessage('flex', JSON.stringify(resultFlex)));
           }
 
-          await lineClient.pushMessage(friend.line_user_id, messages);
+          if (messages.length > 0) {
+            await lineClient.pushMessage(friend.line_user_id, messages);
+          }
         })(),
       );
 

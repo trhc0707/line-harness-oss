@@ -53,12 +53,26 @@ async function createTrackingMap(
 ): Promise<Map<string, { trackingUrl: string; originalUrl: string; label: string }>> {
   const urlMap = new Map<string, { trackingUrl: string; originalUrl: string; label: string }>();
   for (const url of urls) {
-    const link = await createTrackedLink(db, {
-      name: `auto: ${url.slice(0, 60)}`,
-      originalUrl: url,
-    });
+    // Reuse an existing auto-tracked link for the same URL instead of
+    // creating a duplicate on every send. Without this every broadcast /
+    // scenario step / friend push produced a new tracked_links row,
+    // fragmenting click attribution across N rows per URL.
+    const existing = await db
+      .prepare(`SELECT id FROM tracked_links WHERE original_url = ? AND name LIKE 'auto: %' AND is_active = 1 ORDER BY created_at ASC LIMIT 1`)
+      .bind(url)
+      .first<{ id: string }>();
+    let linkId: string;
+    if (existing?.id) {
+      linkId = existing.id;
+    } else {
+      const link = await createTrackedLink(db, {
+        name: `auto: ${url.slice(0, 60)}`,
+        originalUrl: url,
+      });
+      linkId = link.id;
+    }
     // Use direct /t/ URL — Worker handles LINE app detection and LIFF redirect server-side
-    const trackingUrl = `${workerUrl}/t/${link.id}`;
+    const trackingUrl = `${workerUrl}/t/${linkId}`;
     const hostname = new URL(url).hostname.replace('www.', '');
     const label = hostname.length > 20 ? hostname.slice(0, 20) + '…' : hostname;
     urlMap.set(url, { trackingUrl, originalUrl: url, label });

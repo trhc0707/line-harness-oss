@@ -310,6 +310,19 @@ export async function enrollFriendInScenario(
   const id = crypto.randomUUID();
   const now = jstNow();
 
+  // Dedup guard: if a non-completed enrollment already exists for (friend, scenario),
+  // return it instead of creating a duplicate. Prevents double-delivery from unfollow+refollow
+  // or repeated tag_added events. A completed run is allowed to coexist with a new enrollment.
+  const existing = await db
+    .prepare(
+      `SELECT * FROM friend_scenarios
+       WHERE friend_id = ? AND scenario_id = ? AND status != 'completed'
+       ORDER BY started_at DESC LIMIT 1`,
+    )
+    .bind(friendId, scenarioId)
+    .first<FriendScenario>();
+  if (existing) return existing;
+
   // Get the first step to calculate next_delivery_at
   const firstStep = await db
     .prepare(
@@ -322,7 +335,7 @@ export async function enrollFriendInScenario(
   if (!firstStep) {
     const result = await db
       .prepare(
-        `INSERT OR IGNORE INTO friend_scenarios (id, friend_id, scenario_id, current_step_order, status, started_at, next_delivery_at, updated_at)
+        `INSERT INTO friend_scenarios (id, friend_id, scenario_id, current_step_order, status, started_at, next_delivery_at, updated_at)
          VALUES (?, ?, ?, 0, 'completed', ?, NULL, ?)`,
       )
       .bind(id, friendId, scenarioId, now, now)
@@ -337,7 +350,7 @@ export async function enrollFriendInScenario(
   }
 
   const rawDate = new Date(Date.now() + 9 * 60 * 60_000 + firstStep.delay_minutes * 60_000);
-  // Enforce 9:00-21:00 JST delivery window
+  // Enforce 9:00-21:00 JST delivery window (shared default — see apps/worker/src/utils/delivery-window.ts)
   const hours = rawDate.getUTCHours();
   if (hours < 9 || hours >= 21) {
     if (hours >= 21) rawDate.setUTCDate(rawDate.getUTCDate() + 1);
@@ -347,7 +360,7 @@ export async function enrollFriendInScenario(
 
   const result = await db
     .prepare(
-      `INSERT OR IGNORE INTO friend_scenarios (id, friend_id, scenario_id, current_step_order, status, started_at, next_delivery_at, updated_at)
+      `INSERT INTO friend_scenarios (id, friend_id, scenario_id, current_step_order, status, started_at, next_delivery_at, updated_at)
        VALUES (?, ?, ?, 0, 'active', ?, ?, ?)`,
     )
     .bind(id, friendId, scenarioId, now, nextDeliveryAt, now)

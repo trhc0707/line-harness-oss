@@ -97,7 +97,7 @@ export async function createAutomationLog(
 
 /** イベントタイプに一致するアクティブな自動化ルールを取得（優先度順） */
 export async function getActiveAutomationsByEvent(db: D1Database, eventType: string): Promise<AutomationRow[]> {
-  const result = await db.prepare(`SELECT * FROM automations WHERE event_type = ? AND is_active = 1 ORDER BY priority DESC`)
+  const result = await db.prepare(`SELECT * FROM automations WHERE event_type = ? AND is_active = 1 ORDER BY priority DESC, created_at ASC`)
     .bind(eventType).all<AutomationRow>();
   return result.results;
 }

@@ -150,10 +150,23 @@ async function processAutomations(
 ): Promise<void> {
   try {
     const allAutomations = await getActiveAutomationsByEvent(db, eventType);
-    // Filter by account: match this account's automations + unassigned (backward compat)
+    // Filter by account: allow global automations (line_account_id = NULL)
+    // OR automations explicitly scoped to this account. When lineAccountId
+    // is null (webhook could not resolve the account) we MUST NOT fall
+    // back to "match everything" — that caused account-scoped automations
+    // to leak across accounts. Same fix as webhook.ts scenarioAccountMatch.
     const automations = allAutomations.filter(
-      (a) => !a.line_account_id || !lineAccountId || a.line_account_id === lineAccountId,
+      (a) => !a.line_account_id || a.line_account_id === lineAccountId,
     );
+
+    // For message_received, multiple keyword conditions can match a single
+    // incoming text due to substring matching (e.g. "🎓 AIスクール" matches
+    // both keyword="AI" and keyword="スクール"). Without a stop-on-match
+    // rule the user receives N duplicate pushes per tap. Stop after the
+    // first keyword automation that actually matches. Other event types
+    // (friend_add, tag_added, tag_change) keep the existing fan-out
+    // semantics — they don't have the substring overlap problem.
+    const stopAfterFirstMatch = eventType === 'message_received';
 
     for (const automation of automations) {
       const conditions = JSON.parse(automation.conditions) as Record<string, unknown>;
@@ -184,6 +197,8 @@ async function processAutomations(
         actionsResult: JSON.stringify(results),
         status: allSuccess ? 'success' : anySuccess ? 'partial' : 'failed',
       });
+
+      if (stopAfterFirstMatch) break;
     }
   } catch (err) {
     console.error('processAutomations error:', err);
@@ -212,9 +227,19 @@ function matchConditions(
   }
 
   // keyword チェック（message_received イベント用）
+  // Optional conditions.match_type ('exact' | 'contains', default 'contains')
+  // lets admins opt into full-string equality to avoid substring collisions
+  // (e.g. keyword "AI" previously matched "🎓 AIスクール" too).
   if (conditions.keyword !== undefined && payload.eventData) {
     const text = payload.eventData.text as string | undefined;
-    if (!text || !text.includes(conditions.keyword as string)) return false;
+    const keyword = conditions.keyword as string;
+    const matchType = (conditions.match_type as string | undefined) ?? 'contains';
+    if (!text) return false;
+    if (matchType === 'exact') {
+      if (text !== keyword) return false;
+    } else {
+      if (!text.includes(keyword)) return false;
+    }
   }
 
   return true;
@@ -234,6 +259,16 @@ async function executeAction(
 
   switch (action.type) {
     case 'add_tag':
+      // Deliberately does NOT auto-enroll tag_added scenarios. Every
+      // message_received automation currently pairs add_tag with its
+      // own send_message, so auto-enrolling a tag_added welcome
+      // scenario would double-send for any keyword whose tag has one
+      // (e.g. keyword "スクール" + tag 40eb9d55 + scenario e7f867f9).
+      // Tag_added scenarios are fired by the follow-time webhook
+      // handler via ref_code/entry_routes and by POST /api/friends/:id/tags
+      // — those are the correct surfaces for explicit tag assignment.
+      // Automation-add_tag is implicitly an "also-send-this-text"
+      // workflow, not a welcome trigger.
       await addTagToFriend(db, friendId!, action.params.tagId);
       break;
 
@@ -262,9 +297,11 @@ async function executeAction(
         msg = { type: 'text', text: action.params.content };
       }
       // Prefer replyMessage (free) when replyToken is available
+      let deliveryType: 'reply' | 'push' = 'push';
       if (payload.replyToken) {
         try {
           await lineClient.replyMessage(payload.replyToken, [msg]);
+          deliveryType = 'reply';
           // replyToken is single-use, clear it so subsequent actions fall back to push
           payload.replyToken = undefined;
         } catch (err: unknown) {
@@ -280,6 +317,20 @@ async function executeAction(
         }
       } else {
         await lineClient.pushMessage(friend.line_user_id, [msg]);
+      }
+      // Record outgoing message so the Chats UI and analytics see automation
+      // replies — previously these were invisible except via automation_logs.
+      try {
+        const logId = crypto.randomUUID();
+        await db
+          .prepare(
+            `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, delivery_type, created_at)
+             VALUES (?, ?, 'outgoing', ?, ?, NULL, NULL, ?, ?)`,
+          )
+          .bind(logId, friendId, msgType, action.params.content ?? '', deliveryType, jstNow())
+          .run();
+      } catch (logErr) {
+        console.error('automation send_message log insert failed:', logErr);
       }
       break;
     }
@@ -350,8 +401,10 @@ async function processNotifications(
 ): Promise<void> {
   try {
     const allRules = await getActiveNotificationRulesByEvent(db, eventType);
+    // Same cross-account leak fix as processAutomations — drop the
+    // !lineAccountId fallback that turned a null account into a wildcard.
     const rules = allRules.filter(
-      (r) => !r.line_account_id || !lineAccountId || r.line_account_id === lineAccountId,
+      (r) => !r.line_account_id || r.line_account_id === lineAccountId,
     );
 
     for (const rule of rules) {

@@ -173,16 +173,25 @@ liffRoutes.get('/auth/line', async (c) => {
   if (igParam) qrParams.set('ig', igParam);
   const qrUrl = qrParams.toString() ? `${liffUrl}?${qrParams.toString()}` : liffUrl;
 
-  // Mobile: redirect to LIFF URL (opens LINE app directly)
-  // Exception: cross-account links (account param) use OAuth directly
-  // because Account A's LIFF can't open from Account B's LINE chat
+  // Mobile: render an interstitial with a single tap button targeting access.line.me OAuth.
+  // Why not 302: iOS Safari Universal Links fire ONLY on user-tap navigation, NOT on
+  // server-side 302. A direct 302 from worker → liff.line.me or access.line.me ends up
+  // loading the page in Safari (UL never fires) → user sees web login form. The tap on
+  // this interstitial button is a fresh user gesture → UL fires reliably.
+  // Tested: liff.line.me UL does NOT fire reliably on production iPhone, while
+  // access.line.me UL does. So access.line.me is the primary target.
   const isMobile = /iphone|ipad|android|mobile/.test(ua.toLowerCase());
   if (isMobile) {
-    if (accountParam) {
-      // Cross-account link: use OAuth so callback handles push
-      return c.redirect(loginUrl.toString());
-    }
-    return c.redirect(qrUrl);
+    const target = loginUrl.toString();
+    return c.html(`<!DOCTYPE html>
+<html lang="ja"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no"><title>LINEで続ける</title>
+<style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:'Hiragino Sans',system-ui,sans-serif;background:#f5f7f5;min-height:100vh;display:flex;flex-direction:column;justify-content:center;align-items:center;padding:24px}.card{background:#fff;border-radius:20px;box-shadow:0 2px 20px rgba(0,0,0,0.06);max-width:420px;width:100%;padding:40px 24px;text-align:center}.icon{width:64px;height:64px;margin:0 auto 20px}.msg{font-size:16px;color:#333;font-weight:600;line-height:1.6;margin-bottom:28px}.btn{display:block;width:100%;padding:20px;background:linear-gradient(180deg,#06c755 0%,#05b34c 100%);color:#fff;text-decoration:none;border-radius:999px;font-weight:900;font-size:17px;box-shadow:0 4px 0 #047a35,0 8px 20px rgba(6,199,133,0.25);text-shadow:0 1px 2px rgba(0,0,0,0.15)}.hint{font-size:12px;color:#999;margin-top:16px;line-height:1.6}</style>
+</head><body><div class="card">
+<div class="icon"><svg viewBox="0 0 48 48" fill="none"><rect width="48" height="48" rx="12" fill="#06C755"/><path d="M24 12C17.37 12 12 16.58 12 22.2c0 3.54 2.35 6.65 5.86 8.47-.2.74-.76 2.75-.87 3.17-.14.55.2.54.42.39.18-.12 2.84-1.88 4-2.65.84.13 1.7.22 2.59.22 6.63 0 12-4.58 12-10.2S30.63 12 24 12z" fill="#fff"/></svg></div>
+<p class="msg">下のボタンをタップしてLINEで続けてください</p>
+<a href="${target}" class="btn">LINEで友だち追加する</a>
+<p class="hint">タップするとLINEアプリが起動します</p>
+</div></body></html>`);
   }
 
   // PC: show QR code page
@@ -533,8 +542,61 @@ liffRoutes.get('/auth/callback', async (c) => {
         if (route.tag_id) {
           await addTagToFriend(db, friend.id, route.tag_id);
         }
-        // Auto-enroll in scenario (scenario_id stored; enrollment handled by scenario engine)
-        // Future: call enrollFriendInScenario(db, friend.id, route.scenario_id) here
+        // Auto-enroll in route's scenario + send first delay=0 step immediately.
+        // This is what makes /auth/line?ref=xxx the canonical attribution entry
+        // point: tag + welcome scenario fire as one atomic step before the user
+        // even sees the LINE chat.
+        if (route.scenario_id) {
+          try {
+            const { enrollFriendInScenario, getScenarioSteps, advanceFriendScenario, completeFriendScenario } = await import('@line-crm/db');
+            const { LineClient } = await import('@line-crm/line-sdk');
+            const { buildMessage, expandVariables, resolveMetadata } = await import('../services/step-delivery.js');
+
+            const enrollment = await enrollFriendInScenario(db, friend.id, route.scenario_id);
+            if (enrollment) {
+              const steps = await getScenarioSteps(db, route.scenario_id);
+              const firstStep = steps[0];
+              if (firstStep && firstStep.delay_minutes === 0) {
+                let routeAccessToken = c.env.LINE_CHANNEL_ACCESS_TOKEN;
+                if (friend.line_account_id) {
+                  const acct = await getLineAccountById(db, friend.line_account_id);
+                  if (acct?.channel_access_token) routeAccessToken = acct.channel_access_token;
+                }
+                const routeClient = new LineClient(routeAccessToken);
+                const resolvedMeta = await resolveMetadata(db, {
+                  user_id: (friend as unknown as Record<string, string | null>).user_id,
+                  metadata: (friend as unknown as Record<string, string | null>).metadata,
+                });
+                const expandedContent = expandVariables(
+                  firstStep.message_content,
+                  { ...friend, metadata: resolvedMeta } as Parameters<typeof expandVariables>[1],
+                  c.env.WORKER_URL,
+                );
+                await routeClient.pushMessage(lineUserId, [buildMessage(firstStep.message_type, expandedContent)]);
+
+                // Log outgoing message
+                const logId = crypto.randomUUID();
+                await db
+                  .prepare(
+                    `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, delivery_type, created_at) VALUES (?, ?, 'outgoing', ?, ?, NULL, ?, 'push', ?)`,
+                  )
+                  .bind(logId, friend.id, firstStep.message_type, firstStep.message_content, firstStep.id, jstNow())
+                  .run();
+
+                // Advance to next step (cron will pick it up at next_delivery_at)
+                const secondStep = steps[1] ?? null;
+                if (secondStep) {
+                  const nextDate = new Date(Date.now() + 9 * 60 * 60_000 + (secondStep.delay_minutes || 0) * 60_000);
+                  await advanceFriendScenario(db, enrollment.id, firstStep.step_order, nextDate.toISOString().slice(0, -1) + '+09:00');
+                } else {
+                  await completeFriendScenario(db, enrollment.id);
+                }
+              }
+            }
+          } catch (err) {
+            console.error('entry_route scenario enrollment error:', err);
+          }
+        }
       }
     }
 
@@ -608,7 +670,11 @@ liffRoutes.get('/auth/callback', async (c) => {
 
       const scenarios = await getScenarios(db);
       for (const scenario of scenarios) {
-        const scenarioAccountMatch = !scenario.line_account_id || !matchedAccountId || scenario.line_account_id === matchedAccountId;
+        // Match global scenarios (line_account_id = NULL) OR scenarios
+        // explicitly scoped to this account. Do NOT fall back to "match
+        // everything" when matchedAccountId is null — that caused
+        // cross-account scenario fan-out. Same fix as webhook.ts.
+        const scenarioAccountMatch = !scenario.line_account_id || scenario.line_account_id === matchedAccountId;
         if (scenario.trigger_type === 'friend_add' && scenario.is_active && scenarioAccountMatch) {
           const enrollment = await enroll(db, friend.id, scenario.id);
           if (enrollment) {
@@ -861,8 +927,23 @@ liffRoutes.post('/api/liff/link', async (c) => {
     const email = verified.email || null;
 
     const db = c.env.DB;
-    const friend = await getFriendByLineUserId(db, lineUserId);
+    let friend = await getFriendByLineUserId(db, lineUserId);
     if (!friend) {
+      // Pre-create a pending friend row with ref_code so the webhook follow
+      // event can attribute the upcoming friend-add to this entry_route.
+      // is_following=0 marks it as "expected friend, not yet confirmed via webhook".
+      // xh: refs are X Harness tokens — never persist as ref_code.
+      if (body.ref && !body.ref.startsWith('xh:')) {
+        const newId = crypto.randomUUID();
+        await db
+          .prepare(
+            `INSERT INTO friends (id, line_user_id, display_name, ref_code, is_following, created_at, updated_at)
+             VALUES (?, ?, ?, ?, 0, ?, ?)`,
+          )
+          .bind(newId, lineUserId, body.displayName ?? null, body.ref, jstNow(), jstNow())
+          .run();
+        return c.json({ success: true, data: { pending: true } });
+      }
       return c.json({ success: false, error: 'Friend not found' }, 404);
     }
 

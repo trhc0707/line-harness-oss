@@ -309,7 +309,7 @@ chats.post('/api/chats/:id/send', async (c) => {
     // メッセージログに記録
     const logId = crypto.randomUUID();
     await c.env.DB
-      .prepare(`INSERT INTO messages_log (id, friend_id, direction, message_type, content, created_at) VALUES (?, ?, 'outgoing', ?, ?, ?)`)
+      .prepare(`INSERT INTO messages_log (id, friend_id, direction, message_type, content, delivery_type, created_at) VALUES (?, ?, 'outgoing', ?, ?, 'push', ?)`)
       .bind(logId, friend.id, messageType, body.content, jstNow())
       .run();
 

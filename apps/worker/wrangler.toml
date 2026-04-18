@@ -18,9 +18,10 @@ binding = "DB"
 database_name = "line-harness"
 database_id = "YOUR_DEV_D1_DATABASE_ID"
 
-[[r2_buckets]]
-binding = "IMAGES"
-bucket_name = "line-harness-images"
+# R2 未有効化のため無効化
+# [[r2_buckets]]
+# binding = "IMAGES"
+# bucket_name = "line-harness-images"
 
 [triggers]
 crons = ["*/5 * * * *"]
@@ -31,7 +32,7 @@ crons = ["*/5 * * * *"]
 # D1:     npx wrangler d1 execute line-crm --env production --remote --file ...
 # ═══════════════════════════════════════════════════════════════
 [env.production]
-account_id = "YOUR_ACCOUNT_ID"
+account_id = "c364f11fe774002906843f6ff52fbaa9"
 
 [env.production.assets]
 directory = "dist/client"
@@ -40,11 +41,12 @@ binding = "ASSETS"
 [[env.production.d1_databases]]
 binding = "DB"
 database_name = "line-crm"
-database_id = "YOUR_D1_DATABASE_ID"
+database_id = "7087c5c8-32e6-4510-bd2f-102538fc4eb9"
 
-[[env.production.r2_buckets]]
-binding = "IMAGES"
-bucket_name = "line-harness-images"
+# R2 未有効化のため無効化
+# [[env.production.r2_buckets]]
+# binding = "IMAGES"
+# bucket_name = "line-harness-images"
 
 [env.production.triggers]
 crons = ["*/5 * * * *"]

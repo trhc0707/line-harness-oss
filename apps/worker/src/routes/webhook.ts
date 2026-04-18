@@ -12,10 +12,13 @@ import {
   completeFriendScenario,
   upsertChatOnMessage,
   getLineAccounts,
+  getEntryRouteByRefCode,
+  addTagToFriend,
   jstNow,
 } from '@line-crm/db';
 import { fireEvent } from '../services/event-bus.js';
 import { buildMessage, expandVariables } from '../services/step-delivery.js';
+import { enforceDeliveryWindow, jstNowDate, toJstIsoString } from '../utils/delivery-window.js';
 import type { Env } from '../index.js';
 
 const webhook = new Hono<Env>();
@@ -66,7 +69,7 @@ webhook.post('/webhook', async (c) => {
   const processingPromise = (async () => {
     for (const event of body.events) {
       try {
-        await handleEvent(db, lineClient, event, channelAccessToken, matchedAccountId, c.env.WORKER_URL || new URL(c.req.url).origin);
+        await handleEvent(db, lineClient, event, channelAccessToken, matchedAccountId, c.env.WORKER_URL || new URL(c.req.url).origin, c.env.LIFF_URL);
       } catch (err) {
         console.error('Error handling webhook event:', err);
       }
@@ -85,6 +88,7 @@ async function handleEvent(
   lineAccessToken: string,
   lineAccountId: string | null = null,
   workerUrl?: string,
+  liffUrl?: string,
 ): Promise<void> {
   if (event.type === 'follow') {
     const userId =
@@ -119,60 +123,119 @@ async function handleEvent(
       console.log(`[follow] line_account_id set to ${lineAccountId} for friend ${friend.id}`);
     }
 
+    // Pre-set ref_code attribution from LIFF pending row → tag + tag_added scenario
+    // This handles the LIFF flow where /api/liff/link pre-created a pending friend
+    // row with ref_code before the LINE follow webhook fires.
+    const friendWithRef = await db
+      .prepare('SELECT ref_code FROM friends WHERE id = ?')
+      .bind(friend.id)
+      .first<{ ref_code: string | null }>();
+    let refRoute: { tag_id: string | null; scenario_id: string | null } | null = null;
+    if (friendWithRef?.ref_code) {
+      const route = await getEntryRouteByRefCode(db, friendWithRef.ref_code);
+      if (route) {
+        refRoute = { tag_id: route.tag_id, scenario_id: route.scenario_id };
+        if (route.tag_id) {
+          await addTagToFriend(db, friend.id, route.tag_id);
+          console.log(`[follow] applied entry_route tag ${route.tag_id} via ref ${friendWithRef.ref_code}`);
+        }
+      }
+    }
+
+    // Helper: enroll + immediate delivery for one scenario.
+    // Returns true if replyToken was (or may have been) consumed by this enrollment.
+    // NOTE: we treat replyToken as consumed the moment we ATTEMPT replyMessage,
+    // even on failure. LINE replyTokens are single-use and any retry (including from
+    // another scenario in the same loop) returns "Invalid reply token".
+    const enrollAndDeliver = async (scenarioId: string, useReply: boolean): Promise<boolean> => {
+      const friendScenario = await enrollFriendInScenario(db, friend.id, scenarioId);
+      if (!friendScenario) return false;
+      const steps = await getScenarioSteps(db, scenarioId);
+      const firstStep = steps[0];
+      if (!firstStep || firstStep.delay_minutes !== 0 || friendScenario.status !== 'active') return false;
+      let consumedReply = false;
+      try {
+        const { resolveMetadata } = await import('../services/step-delivery.js');
+        const resolvedMeta = await resolveMetadata(db, { user_id: (friend as unknown as Record<string, string | null>).user_id, metadata: (friend as unknown as Record<string, string | null>).metadata });
+        const expandedContent = expandVariables(firstStep.message_content, { ...friend, metadata: resolvedMeta } as Parameters<typeof expandVariables>[1]);
+        const message = buildMessage(firstStep.message_type, expandedContent);
+        if (useReply) {
+          consumedReply = true;
+          await lineClient.replyMessage(event.replyToken, [message]);
+        } else {
+          await lineClient.pushMessage(userId, [message]);
+        }
+        console.log(`Immediate delivery: sent step ${firstStep.id} to ${userId} (${useReply ? 'reply' : 'push'})`);
+        const logId = crypto.randomUUID();
+        await db
+          .prepare(
+            `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, delivery_type, created_at)
+             VALUES (?, ?, 'outgoing', ?, ?, NULL, ?, ?, ?)`,
+          )
+          .bind(logId, friend.id, firstStep.message_type, firstStep.message_content, firstStep.id, useReply ? 'reply' : 'push', jstNow())
+          .run();
+        const secondStep = steps[1] ?? null;
+        if (secondStep) {
+          const nextDeliveryDate = jstNowDate();
+          nextDeliveryDate.setMinutes(nextDeliveryDate.getMinutes() + secondStep.delay_minutes);
+          const windowedDate = enforceDeliveryWindow(nextDeliveryDate);
+          await advanceFriendScenario(db, friendScenario.id, firstStep.step_order, toJstIsoString(windowedDate));
+        } else {
+          await completeFriendScenario(db, friendScenario.id);
+        }
+        return consumedReply;
+      } catch (err) {
+        console.error('Failed immediate delivery for scenario', scenarioId, err);
+        // Still return consumedReply so caller doesn't retry the (now-invalid) replyToken.
+        return consumedReply;
+      }
+    };
+
     // friend_add シナリオに登録（このアカウントのシナリオのみ）
+    let replyTokenUsed = false;
     const scenarios = await getScenarios(db);
     for (const scenario of scenarios) {
-      // Only trigger scenarios belonging to this account (or unassigned for backward compat)
-      const scenarioAccountMatch = !scenario.line_account_id || !lineAccountId || scenario.line_account_id === lineAccountId;
+      // Account-match rule:
+      // - scenario.line_account_id NULL  → global scenario, always runs
+      // - scenario.line_account_id SET   → must match the webhook's resolved account
+      // NOTE: the previous rule `!scenario.line_account_id || !lineAccountId || ...`
+      // was incorrect: when the webhook matched the env-fallback account (lineAccountId=null),
+      // the `!lineAccountId` branch made EVERY scenario match regardless of its account,
+      // which fired other accounts' scenarios for the wrong friend.
+      const scenarioAccountMatch = !scenario.line_account_id || scenario.line_account_id === lineAccountId;
       if (scenario.trigger_type === 'friend_add' && scenario.is_active && scenarioAccountMatch) {
         try {
-          // INSERT OR IGNORE handles dedup via UNIQUE(friend_id, scenario_id)
-          const friendScenario = await enrollFriendInScenario(db, friend.id, scenario.id);
-          if (!friendScenario) continue; // already enrolled
-
-            // Immediate delivery: if the first step has delay=0, send it now via replyMessage (free)
-            const steps = await getScenarioSteps(db, scenario.id);
-            const firstStep = steps[0];
-            if (firstStep && firstStep.delay_minutes === 0 && friendScenario.status === 'active') {
-              try {
-                const { resolveMetadata } = await import('../services/step-delivery.js');
-                const resolvedMeta = await resolveMetadata(db, { user_id: (friend as unknown as Record<string, string | null>).user_id, metadata: (friend as unknown as Record<string, string | null>).metadata });
-                const expandedContent = expandVariables(firstStep.message_content, { ...friend, metadata: resolvedMeta } as Parameters<typeof expandVariables>[1]);
-                const message = buildMessage(firstStep.message_type, expandedContent);
-                await lineClient.replyMessage(event.replyToken, [message]);
-                console.log(`Immediate delivery: sent step ${firstStep.id} to ${userId}`);
-
-                // Log outgoing message (replyMessage = 無料)
-                const logId = crypto.randomUUID();
-                await db
-                  .prepare(
-                    `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, delivery_type, created_at)
-                     VALUES (?, ?, 'outgoing', ?, ?, NULL, ?, 'reply', ?)`,
-                  )
-                  .bind(logId, friend.id, firstStep.message_type, firstStep.message_content, firstStep.id, jstNow())
-                  .run();
-
-                // Advance or complete the friend_scenario
-                const secondStep = steps[1] ?? null;
-                if (secondStep) {
-                  const nextDeliveryDate = new Date(Date.now() + 9 * 60 * 60_000);
-                  nextDeliveryDate.setMinutes(nextDeliveryDate.getMinutes() + secondStep.delay_minutes);
-                  // Enforce 9:00-21:00 JST delivery window
-                  const h = nextDeliveryDate.getUTCHours();
-                  if (h < 9 || h >= 21) {
-                    if (h >= 21) nextDeliveryDate.setUTCDate(nextDeliveryDate.getUTCDate() + 1);
-                    nextDeliveryDate.setUTCHours(9, 0, 0, 0);
-                  }
-                  await advanceFriendScenario(db, friendScenario.id, firstStep.step_order, nextDeliveryDate.toISOString().slice(0, -1) + '+09:00');
-                } else {
-                  await completeFriendScenario(db, friendScenario.id);
-                }
-              } catch (err) {
-                console.error('Failed immediate delivery for scenario', scenario.id, err);
-              }
-            }
+          const used = await enrollAndDeliver(scenario.id, !replyTokenUsed);
+          if (used) replyTokenUsed = true;
         } catch (err) {
           console.error('Failed to enroll friend in scenario', scenario.id, err);
+        }
+      }
+    }
+
+    // tag_added シナリオ: ref_code 経由で付与されたタグに紐づくシナリオを起動
+    if (refRoute?.tag_id) {
+      for (const scenario of scenarios) {
+        // Account-match rule:
+      // - scenario.line_account_id NULL  → global scenario, always runs
+      // - scenario.line_account_id SET   → must match the webhook's resolved account
+      // NOTE: the previous rule `!scenario.line_account_id || !lineAccountId || ...`
+      // was incorrect: when the webhook matched the env-fallback account (lineAccountId=null),
+      // the `!lineAccountId` branch made EVERY scenario match regardless of its account,
+      // which fired other accounts' scenarios for the wrong friend.
+      const scenarioAccountMatch = !scenario.line_account_id || scenario.line_account_id === lineAccountId;
+        if (
+          scenario.trigger_type === 'tag_added' &&
+          scenario.is_active &&
+          scenarioAccountMatch &&
+          scenario.trigger_tag_id === refRoute.tag_id
+        ) {
+          try {
+            const used = await enrollAndDeliver(scenario.id, !replyTokenUsed);
+            if (used) replyTokenUsed = true;
+          } catch (err) {
+            console.error('Failed to enroll friend in tag_added scenario', scenario.id, err);
+          }
         }
       }
     }
@@ -259,10 +322,31 @@ async function handleEvent(
       .bind(logId, friend.id, incomingText, now)
       .run();
 
+    // Load active auto_replies for this account (global + scoped). Used both for
+    // matching below AND for deriving the set of "button-like" keywords that should
+    // NOT flip the chat to unread. Replaces the previously-hardcoded autoKeywords
+    // list which drifted every time a new auto_reply rule was added.
+    const autoReplyQuery = lineAccountId
+      ? `SELECT * FROM auto_replies WHERE is_active = 1 AND (line_account_id IS NULL OR line_account_id = ?) ORDER BY created_at ASC`
+      : `SELECT * FROM auto_replies WHERE is_active = 1 AND line_account_id IS NULL ORDER BY created_at ASC`;
+    const autoReplyStmt = db.prepare(autoReplyQuery);
+    const autoRepliesResult = await (lineAccountId ? autoReplyStmt.bind(lineAccountId) : autoReplyStmt)
+      .all<{
+        id: string;
+        keyword: string;
+        match_type: 'exact' | 'contains';
+        response_type: string;
+        response_content: string;
+        is_active: number;
+        created_at: string;
+      }>();
+    const autoReplies = autoRepliesResult.results;
+
     // チャットを作成/更新（ユーザーの自発的メッセージのみ unread にする）
-    // ボタンタップ等の自動応答キーワードは除外
-    const autoKeywords = ['料金', '機能', 'API', 'フォーム', 'ヘルプ', 'UUID', 'UUID連携について教えて', 'UUID連携を確認', '配信時間', '導入支援を希望します', 'アカウント連携を見る', '体験を完了する', 'BAN対策を見る', '連携確認'];
-    const isAutoKeyword = autoKeywords.some(k => incomingText === k);
+    // ボタンタップ等の自動応答キーワード・配信時間コマンドは除外
+    const isAutoKeyword = autoReplies.some(r =>
+      r.match_type === 'exact' ? incomingText === r.keyword : incomingText.includes(r.keyword)
+    );
     const isTimeCommand = /(?:配信時間|配信|届けて|通知)[はを]?\s*\d{1,2}\s*時/.test(incomingText);
     if (!isAutoKeyword && !isTimeCommand) {
       await upsertChatOnMessage(db, friend.id);
@@ -333,7 +417,7 @@ async function handleEvent(
               footer: { type: 'box', layout: 'vertical', paddingAll: '16px',
                 contents: [
                   { type: 'button', action: { type: 'message', label: '導入について相談する', text: '導入支援を希望します' }, style: 'primary', color: '#06C755' },
-                  ...(c.env.LIFF_URL ? [{ type: 'button', action: { type: 'uri', label: 'フィードバックを送る', uri: `${c.env.LIFF_URL}?page=form` }, style: 'secondary', margin: 'sm' }] : []),
+                  ...(liffUrl ? [{ type: 'button', action: { type: 'uri', label: 'フィードバックを送る', uri: `${liffUrl}?page=form` }, style: 'secondary', margin: 'sm' }] : []),
                 ],
               },
             }))]);
@@ -359,30 +443,20 @@ async function handleEvent(
     // 自動返信チェック（このアカウントのルール + グローバルルールのみ）
     // NOTE: Auto-replies use replyMessage (free, no quota) instead of pushMessage
     // The replyToken is only valid for ~1 minute after the message event
-    const autoReplyQuery = lineAccountId
-      ? `SELECT * FROM auto_replies WHERE is_active = 1 AND (line_account_id IS NULL OR line_account_id = ?) ORDER BY created_at ASC`
-      : `SELECT * FROM auto_replies WHERE is_active = 1 AND line_account_id IS NULL ORDER BY created_at ASC`;
-    const autoReplyStmt = db.prepare(autoReplyQuery);
-    const autoReplies = await (lineAccountId ? autoReplyStmt.bind(lineAccountId) : autoReplyStmt)
-      .all<{
-        id: string;
-        keyword: string;
-        match_type: 'exact' | 'contains';
-        response_type: string;
-        response_content: string;
-        is_active: number;
-        created_at: string;
-      }>();
-
+    // (autoReplies already loaded above for chat-unread suppression)
     let matched = false;
     let replyTokenConsumed = false;
-    for (const rule of autoReplies.results) {
+    for (const rule of autoReplies) {
       const isMatch =
         rule.match_type === 'exact'
           ? incomingText === rule.keyword
           : incomingText.includes(rule.keyword);
 
       if (isMatch) {
+        // Mark replyToken as consumed BEFORE sending — LINE replyTokens are single-use
+        // and throwing mid-request can still leave the token invalidated on LINE's side.
+        // Falsely treating it as unused would cause fireEvent to retry it and fail.
+        replyTokenConsumed = true;
         try {
           // Expand template variables ({{name}}, {{uid}}, {{auth_url:CHANNEL_ID}})
           const { resolveMetadata: resolveMeta2 } = await import('../services/step-delivery.js');
@@ -390,7 +464,6 @@ async function handleEvent(
           const expandedContent = expandVariables(rule.response_content, { ...friend, metadata: resolvedMeta2 } as Parameters<typeof expandVariables>[1], workerUrl);
           const replyMsg = buildMessage(rule.response_type, expandedContent);
           await lineClient.replyMessage(event.replyToken, [replyMsg]);
-          replyTokenConsumed = true;
 
           // 送信ログ（replyMessage = 無料）
           const outLogId = crypto.randomUUID();
@@ -403,7 +476,6 @@ async function handleEvent(
             .run();
         } catch (err) {
           console.error('Failed to send auto-reply', err);
-          // replyToken may still be unused if replyMessage threw before LINE accepted it
         }
 
         matched = true;

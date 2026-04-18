@@ -94,7 +94,10 @@ function escapeHtml(str: string): string {
 
 // ─── UI States ──────────────────────────────────────────
 
-function showFriendAdd(profile: { displayName: string; pictureUrl?: string }) {
+function showFriendAdd(
+  profile: { displayName: string; pictureUrl?: string },
+  onFriendDetected?: () => void | Promise<void>,
+) {
   const container = document.getElementById('app')!;
   const friendAddUrl = BOT_BASIC_ID
     ? `https://line.me/R/ti/p/${BOT_BASIC_ID}`
@@ -117,17 +120,26 @@ function showFriendAdd(profile: { displayName: string; pictureUrl?: string }) {
   // 友だち追加後に戻ってきたら自動で再チェック
   // 一度発火したら listener を外して、ユーザーが LIFF をフォアグラウンド復帰するたびに
   // 重複 push が走らないようにする（送信後にアプリ切り替えで再発火する事故を防ぐ）
-  let formLinkSent = false;
+  let handled = false;
   const onVisibilityChange = async () => {
     if (document.visibilityState !== 'visible') return;
+    if (handled) return;
     try {
       const { friendFlag } = await liff.getFriendship();
       if (!friendFlag) return;
+      handled = true;
+      document.removeEventListener('visibilitychange', onVisibilityChange);
 
-      // Send form link if form param exists (was lost during friend-add flow)
+      // Custom hook: caller can override post-add behavior (e.g. go straight
+      // to a form page instead of the generic completion screen).
+      if (onFriendDetected) {
+        await onFriendDetected();
+        return;
+      }
+
+      // Default: send form link if legacy `?form=` param exists, then show completion
       const formParam = new URLSearchParams(window.location.search).get('form');
-      if (formParam && !formLinkSent) {
-        formLinkSent = true;
+      if (formParam) {
         try {
           const fp = await liff.getProfile();
           const idToken = liff.getIDToken();
@@ -145,7 +157,6 @@ function showFriendAdd(profile: { displayName: string; pictureUrl?: string }) {
           });
         } catch { /* best-effort */ }
       }
-      document.removeEventListener('visibilitychange', onVisibilityChange);
       showCompletion(profile, false);
     } catch {
       // ignore
@@ -192,6 +203,60 @@ function showError(message: string) {
       <p class="error">${escapeHtml(message)}</p>
     </div>
   `;
+}
+
+// ─── Tracked-link entry flow (no login screen, no keyword send) ──────
+//
+// Entry URL shape:
+//   liff.line.me/<LIFF_ID>?entry=form&id=<FORM_ID>&ref=<LINK_ID>
+//
+// note記事 → /t/<LINK_ID> → bridge HTML → このURL でLIFFが開く、という流れ。
+// 既に友だちなら直接フォームへ、未友だちなら友だち追加UIを出して、追加後に
+// 自動でフォーム画面へ遷移する。裏で resolve エンドポイントを叩いて
+// tag付与・シナリオ登録まで走らせる。
+async function linkAndEntryFlow(formId: string, linkId: string): Promise<void> {
+  try {
+    const [profile, friendship, rawIdToken] = await Promise.all([
+      liff.getProfile(),
+      liff.getFriendship(),
+      Promise.resolve(liff.getIDToken() || ''),
+    ]);
+
+    // 既存の /api/liff/link を先に叩いてfriend recordに ref を紐付ける
+    // (webhookの友だち追加イベントよりLIFFの初回表示のほうが早いことがあるが、
+    //  その場合は friend_not_found でbest-effort失敗するだけで問題なし)
+    apiCall('/api/liff/link', {
+      method: 'POST',
+      body: JSON.stringify({
+        idToken: rawIdToken,
+        displayName: profile.displayName,
+        existingUuid: getSavedUuid(),
+        ref: linkId,
+      }),
+    }).catch(() => { /* silent — link is best-effort */ });
+
+    const goForm = async (): Promise<void> => {
+      // 裏でresolve → tag/scenario enroll + 即時1通目配信
+      apiCall(`/api/tracked-links/${encodeURIComponent(linkId)}/resolve`, {
+        method: 'POST',
+        body: JSON.stringify({ lineUserId: profile.userId, idToken: rawIdToken }),
+      }).catch(() => { /* silent — resolve is best-effort */ });
+
+      const nextUrl =
+        `/?page=form&id=${encodeURIComponent(formId)}&ref=${encodeURIComponent(linkId)}`;
+      window.location.replace(nextUrl);
+    };
+
+    if (friendship.friendFlag) {
+      await goForm();
+      return;
+    }
+
+    // 未友だち: 友だち追加UI → 戻ってきたら自動でフォームへ
+    showFriendAdd(profile, goForm);
+  } catch (err) {
+    showError(err instanceof Error ? err.message : 'エントリ処理エラー');
+  }
 }
 
 // ─── Core Flow ──────────────────────────────────────────
@@ -319,11 +384,22 @@ async function main() {
       // fallback: BOT_BASIC_ID remains empty, friend-add URL won't auto-redirect
     }
 
+    const params = new URLSearchParams(window.location.search);
+
+    // Tracked-link entry: note記事 → /t/:linkId → bridge → LIFF.
+    // Short-circuit any other routing — we handle friendship + form redirect here.
+    const entry = params.get('entry');
+    const entryFormId = params.get('id');
+    const entryLinkId = params.get('ref');
+    if (entry === 'form' && entryFormId && entryLinkId) {
+      await linkAndEntryFlow(entryFormId, entryLinkId);
+      return;
+    }
+
     const page = getPage();
     if (page === 'book') {
       await initBooking();
     } else if (page === 'form') {
-      const params = new URLSearchParams(window.location.search);
       const formId = params.get('id');
       await initForm(formId);
     } else if (!page) {

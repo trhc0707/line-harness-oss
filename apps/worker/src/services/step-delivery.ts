@@ -11,6 +11,13 @@ import {
 import type { LineClient } from '@line-crm/line-sdk';
 import type { Message } from '@line-crm/line-sdk';
 import { jitterDeliveryTime, addJitter, sleep } from './stealth.js';
+import {
+  DELIVERY_WINDOW_START_HOUR,
+  DELIVERY_WINDOW_END_HOUR,
+  enforceDeliveryWindow,
+  jstNowDate,
+  toJstIsoString,
+} from '../utils/delivery-window.js';
 
 /**
  * Replace template variables in message content.
@@ -55,7 +62,10 @@ export function expandVariables(
   result = result.replace(/,\s*\]/g, ']');
   result = result.replace(/\{\{metadata\.([^}]+)\}\}/g, (_match, key) => {
     const val = meta[key];
-    if (val == null) return '';
+    if (val == null) {
+      console.warn(`[expandVariables] undefined metadata key "${key}" for friend ${friend.id} — replaced with empty string`);
+      return '';
+    }
     return Array.isArray(val) ? val.join(', ') : String(val);
   });
   if (apiOrigin) {
@@ -88,27 +98,6 @@ export async function resolveMetadata(
   return {};
 }
 
-/** Default delivery window: 9:00-23:00 JST. If outside, push to next 9:00 AM. */
-const DEFAULT_START_HOUR = 9;
-const DEFAULT_END_HOUR = 23;
-
-function enforceDeliveryWindow(date: Date, preferredHour?: number): Date {
-  // date is already shifted to JST epoch (+9h)
-  const hours = date.getUTCHours();
-  const startHour = preferredHour ?? DEFAULT_START_HOUR;
-  const endHour = DEFAULT_END_HOUR;
-
-  if (hours >= startHour && hours < endHour) return date;
-
-  // Outside window: push to next preferred start hour
-  const result = new Date(date);
-  if (hours >= endHour) {
-    result.setUTCDate(result.getUTCDate() + 1);
-  }
-  result.setUTCHours(startHour, 0, 0, 0);
-  return result;
-}
-
 const MAX_SENDS_PER_CRON = 40; // CF Free plan: 50 subrequests limit (margin for other jobs)
 
 export async function processStepDeliveries(
@@ -116,9 +105,8 @@ export async function processStepDeliveries(
   lineClient: LineClient,
   workerUrl?: string,
 ): Promise<void> {
-  // Skip delivery outside 9:00-23:00 JST window
-  const jstHour = new Date(Date.now() + 9 * 60 * 60_000).getUTCHours();
-  if (jstHour < DEFAULT_START_HOUR || jstHour >= DEFAULT_END_HOUR) return;
+  const jstHour = jstNowDate().getUTCHours();
+  if (jstHour < DELIVERY_WINDOW_START_HOUR || jstHour >= DELIVERY_WINDOW_END_HOUR) return;
 
   const now = jstNow();
   const dueFriendScenarios = await getFriendScenariosDueForDelivery(db, now);
@@ -190,22 +178,22 @@ async function processSingleDelivery(
       if (currentStep.next_step_on_false !== null && currentStep.next_step_on_false !== undefined) {
         const jumpStep = steps.find((s) => s.step_order === currentStep.next_step_on_false);
         if (jumpStep) {
-          const nextDate = new Date(Date.now() + 9 * 60 * 60_000);
+          const nextDate = jstNowDate();
           nextDate.setMinutes(nextDate.getMinutes() + jumpStep.delay_minutes);
           const windowedDate = enforceDeliveryWindow(nextDate, preferredHour);
           const jitteredDate = jitterDeliveryTime(windowedDate);
-          await advanceFriendScenario(db, fs.id, currentStep.step_order, jitteredDate.toISOString().slice(0, -1) + '+09:00');
+          await advanceFriendScenario(db, fs.id, currentStep.step_order, toJstIsoString(jitteredDate));
           return false;
         }
       }
       const nextIndex = steps.indexOf(currentStep) + 1;
       if (nextIndex < steps.length) {
         const nextStep = steps[nextIndex];
-        const nextDate = new Date(Date.now() + 9 * 60 * 60_000);
+        const nextDate = jstNowDate();
         nextDate.setMinutes(nextDate.getMinutes() + nextStep.delay_minutes);
         const windowedDate = enforceDeliveryWindow(nextDate, preferredHour);
         const jitteredDate = jitterDeliveryTime(windowedDate);
-        await advanceFriendScenario(db, fs.id, currentStep.step_order, jitteredDate.toISOString().slice(0, -1) + '+09:00');
+        await advanceFriendScenario(db, fs.id, currentStep.step_order, toJstIsoString(jitteredDate));
       } else {
         await completeFriendScenario(db, fs.id);
       }
@@ -244,8 +232,8 @@ async function processSingleDelivery(
   const logId = crypto.randomUUID();
   await db
     .prepare(
-      `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, created_at)
-       VALUES (?, ?, 'outgoing', ?, ?, NULL, ?, ?)`,
+      `INSERT INTO messages_log (id, friend_id, direction, message_type, content, broadcast_id, scenario_step_id, delivery_type, created_at)
+       VALUES (?, ?, 'outgoing', ?, ?, NULL, ?, 'push', ?)`,
     )
     .bind(logId, friend.id, currentStep.message_type, currentStep.message_content, currentStep.id, jstNow())
     .run();
@@ -255,12 +243,11 @@ async function processSingleDelivery(
   const nextStep = currentIndex + 1 < steps.length ? steps[currentIndex + 1] : null;
 
   if (nextStep) {
-    // Schedule next delivery with stealth jitter + delivery window enforcement
-    const nextDeliveryDate = new Date(Date.now() + 9 * 60 * 60_000);
+    const nextDeliveryDate = jstNowDate();
     nextDeliveryDate.setMinutes(nextDeliveryDate.getMinutes() + nextStep.delay_minutes);
     const windowedDate = enforceDeliveryWindow(nextDeliveryDate, preferredHour);
     const jitteredDate = jitterDeliveryTime(windowedDate);
-    await advanceFriendScenario(db, fs.id, currentStep.step_order, jitteredDate.toISOString().slice(0, -1) + '+09:00');
+    await advanceFriendScenario(db, fs.id, currentStep.step_order, toJstIsoString(jitteredDate));
   } else {
     // This was the last step
     await completeFriendScenario(db, fs.id);
@@ -353,7 +340,6 @@ export function buildMessage(messageType: string, messageContent: string, altTex
   }
 
   if (messageType === 'image') {
-    // messageContent is expected to be JSON: { originalContentUrl, previewImageUrl }
     try {
       const parsed = JSON.parse(messageContent) as {
         originalContentUrl: string;
@@ -364,8 +350,8 @@ export function buildMessage(messageType: string, messageContent: string, altTex
         originalContentUrl: parsed.originalContentUrl,
         previewImageUrl: parsed.previewImageUrl,
       };
-    } catch {
-      // Fallback: treat as text if parsing fails
+    } catch (err) {
+      console.error(`[buildMessage] image JSON parse failed — falling back to text. error=${err instanceof Error ? err.message : String(err)}`);
       return { type: 'text', text: messageContent };
     }
   }
@@ -373,11 +359,10 @@ export function buildMessage(messageType: string, messageContent: string, altTex
   if (messageType === 'flex') {
     try {
       const contents = JSON.parse(messageContent);
-      // Remove empty text nodes (from {{#if_ref}} conditional blocks)
       cleanEmptyNodes(contents);
-      // Extract first text element for altText (shown in notifications)
       return { type: 'flex', altText: altText || extractFlexAltText(contents), contents };
-    } catch {
+    } catch (err) {
+      console.error(`[buildMessage] flex JSON parse failed — falling back to text. error=${err instanceof Error ? err.message : String(err)}`);
       return { type: 'text', text: messageContent };
     }
   }
