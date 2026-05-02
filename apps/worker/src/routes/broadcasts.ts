@@ -265,6 +265,12 @@ broadcasts.post('/api/broadcasts/:id/send-segment', async (c) => {
   }
 });
 
+// D1 has a hard 100-bind parameter limit per query. The cron-side segment query
+// binds all friendIds plus a couple of filter values, so we cap inputs well
+// under that ceiling to keep the queued send safe.
+const MULTICAST_FRIEND_IDS_MAX = 90;
+const VALID_MESSAGE_TYPES: readonly BroadcastMessageType[] = ['text', 'image', 'flex'];
+
 // POST /api/broadcasts/multicast-queue — 選択した友だちへのキュー配信
 broadcasts.post('/api/broadcasts/multicast-queue', async (c) => {
   try {
@@ -279,48 +285,78 @@ broadcasts.post('/api/broadcasts/multicast-queue', async (c) => {
     if (!Array.isArray(body.friendIds) || body.friendIds.length === 0) {
       return c.json({ success: false, error: 'friendIds (non-empty array) is required' }, 400);
     }
+    if (body.friendIds.length > MULTICAST_FRIEND_IDS_MAX) {
+      return c.json(
+        {
+          success: false,
+          error: `friendIds exceeds max of ${MULTICAST_FRIEND_IDS_MAX}. Use a tag/segment broadcast for larger sends.`,
+        },
+        400,
+      );
+    }
     if (!body.messageType || !body.messageContent) {
       return c.json({ success: false, error: 'messageType and messageContent are required' }, 400);
     }
+    if (!VALID_MESSAGE_TYPES.includes(body.messageType as BroadcastMessageType)) {
+      return c.json(
+        { success: false, error: `messageType must be one of: ${VALID_MESSAGE_TYPES.join(', ')}` },
+        400,
+      );
+    }
+    if (!body.lineAccountId) {
+      return c.json({ success: false, error: 'lineAccountId is required' }, 400);
+    }
 
-    // Create a broadcast record
-    const broadcast = await createBroadcast(c.env.DB, {
-      title: `友だち選択配信 (${body.friendIds.length}人)`,
-      messageType: body.messageType as BroadcastMessageType,
-      messageContent: body.messageContent,
-      targetType: 'tag', // Reuse 'tag' target_type; actual targeting is via segment_conditions
-      targetTagId: null,
-    });
-
-    // Set alt_text, line_account_id if provided
-    const updates: string[] = [];
-    const binds: unknown[] = [];
-    if (body.altText) { updates.push('alt_text = ?'); binds.push(body.altText); }
-    if (body.lineAccountId) { updates.push('line_account_id = ?'); binds.push(body.lineAccountId); }
-    if (updates.length > 0) {
-      binds.push(broadcast.id);
-      await c.env.DB.prepare(`UPDATE broadcasts SET ${updates.join(', ')} WHERE id = ?`)
-        .bind(...binds).run();
+    // Account boundary check: every friendId must belong to the given lineAccountId.
+    // Reject mixed/mismatched ids before creating the broadcast — sending under the
+    // wrong channel is a LINE TOS violation (account ban risk).
+    const uniqueFriendIds = Array.from(new Set(body.friendIds));
+    const placeholders = uniqueFriendIds.map(() => '?').join(',');
+    const matchRow = await c.env.DB.prepare(
+      `SELECT COUNT(*) AS count FROM friends
+         WHERE id IN (${placeholders}) AND line_account_id = ?`,
+    )
+      .bind(...uniqueFriendIds, body.lineAccountId)
+      .first<{ count: number }>();
+    const matched = matchRow?.count ?? 0;
+    if (matched !== uniqueFriendIds.length) {
+      return c.json(
+        {
+          success: false,
+          error:
+            'One or more friendIds do not belong to the given lineAccountId. Cross-account multicast is not allowed.',
+        },
+        400,
+      );
     }
 
     // Build segment_conditions with friend_ids + is_following filter
     const segmentConditions: SegmentCondition = {
       operator: 'AND',
       rules: [
-        { type: 'friend_ids', value: body.friendIds },
+        { type: 'friend_ids', value: uniqueFriendIds },
         { type: 'is_following', value: true },
       ],
     };
 
-    // Queue for batch processing: set status='sending', batch_offset=0, segment_conditions
-    await c.env.DB.prepare(
-      `UPDATE broadcasts SET status = 'sending', batch_offset = 0, segment_conditions = ? WHERE id = ?`
-    ).bind(JSON.stringify(segmentConditions), broadcast.id).run();
+    // Atomic insert: status='sending', batch_offset=0, segment_conditions, line_account_id, alt_text
+    // all written in a single INSERT so a partially-saved row can never appear.
+    const broadcast = await createBroadcast(c.env.DB, {
+      title: `友だち選択配信 (${uniqueFriendIds.length}人)`,
+      messageType: body.messageType as BroadcastMessageType,
+      messageContent: body.messageContent,
+      targetType: 'tag', // Reuse 'tag' target_type; actual targeting is via segment_conditions
+      targetTagId: null,
+      lineAccountId: body.lineAccountId,
+      altText: body.altText ?? null,
+      segmentConditions: JSON.stringify(segmentConditions),
+      status: 'sending',
+      batchOffset: 0,
+    });
 
-    const result = await getBroadcastById(c.env.DB, broadcast.id);
     return c.json({
       success: true,
-      data: result ? serializeBroadcast(result) : null,
+      data: serializeBroadcast(broadcast),
       queued: true,
       message: 'Multicast queued for batch processing by Cron',
     }, 202);

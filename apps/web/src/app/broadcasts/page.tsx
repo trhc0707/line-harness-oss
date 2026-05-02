@@ -63,7 +63,7 @@ export default function BroadcastsPage() {
 }
 
 function BroadcastList() {
-  const { selectedAccountId } = useAccount()
+  const { selectedAccountId, loading: accountsLoading } = useAccount()
   const [broadcasts, setBroadcasts] = useState<ApiBroadcast[]>([])
   const [tags, setTags] = useState<Tag[]>([])
   const [loading, setLoading] = useState(true)
@@ -96,6 +96,8 @@ function BroadcastList() {
   }
 
   const load = useCallback(async () => {
+    if (accountsLoading) return
+
     setLoading(true)
     setError('')
     try {
@@ -111,7 +113,7 @@ function BroadcastList() {
     } finally {
       setLoading(false)
     }
-  }, [selectedAccountId])
+  }, [selectedAccountId, accountsLoading])
 
   useEffect(() => { load() }, [load])
 
@@ -243,8 +245,10 @@ function BroadcastList() {
                         '全員'
                       ) : tagName ? (
                         <span>タグ: {tagName}</span>
-                      ) : (
+                      ) : broadcast.targetTagId ? (
                         'タグ指定'
+                      ) : (
+                        '選択した友だち'
                       )}
                     </td>
 

@@ -27,7 +27,9 @@ LEFT JOIN broadcast_insights bi ON b.id = bi.broadcast_id
   AND bi.id = (SELECT id FROM broadcast_insights WHERE broadcast_id = b.id ORDER BY created_at DESC LIMIT 1)`;
   const params: unknown[] = [];
   if (accountId) {
-    sql += ` WHERE b.line_account_id = ?`;
+    // Include legacy broadcasts created before multi-account support. Those
+    // rows have no line_account_id, but they are still valid dashboard history.
+    sql += ` WHERE (b.line_account_id = ? OR b.line_account_id IS NULL)`;
     params.push(accountId);
   }
   sql += ` ORDER BY COALESCE(b.sent_at, b.scheduled_at, b.created_at) DESC`;
@@ -64,6 +66,12 @@ export interface CreateBroadcastInput {
   targetType: BroadcastTargetType;
   targetTagId?: string | null;
   scheduledAt?: string | null;
+  /** Optional fields written atomically with the initial INSERT */
+  lineAccountId?: string | null;
+  altText?: string | null;
+  segmentConditions?: string | null;
+  status?: BroadcastStatus;
+  batchOffset?: number;
 }
 
 export async function createBroadcast(
@@ -73,13 +81,16 @@ export async function createBroadcast(
   const id = crypto.randomUUID();
   const now = jstNow();
 
-  const initialStatus: BroadcastStatus = input.scheduledAt ? 'scheduled' : 'draft';
+  const initialStatus: BroadcastStatus =
+    input.status ?? (input.scheduledAt ? 'scheduled' : 'draft');
 
   await db
     .prepare(
       `INSERT INTO broadcasts
-         (id, title, message_type, message_content, target_type, target_tag_id, status, scheduled_at, sent_at, total_count, success_count, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, 0, ?)`,
+         (id, title, message_type, message_content, target_type, target_tag_id,
+          status, scheduled_at, sent_at, total_count, success_count,
+          line_account_id, alt_text, segment_conditions, batch_offset, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, 0, ?, ?, ?, ?, ?)`,
     )
     .bind(
       id,
@@ -90,6 +101,10 @@ export async function createBroadcast(
       input.targetTagId ?? null,
       initialStatus,
       input.scheduledAt ?? null,
+      input.lineAccountId ?? null,
+      input.altText ?? null,
+      input.segmentConditions ?? null,
+      input.batchOffset ?? 0,
       now,
     )
     .run();
